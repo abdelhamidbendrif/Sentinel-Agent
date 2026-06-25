@@ -1,0 +1,7 @@
+# Pinned to the exact versions tested during development.
+# ADK's Runner/session API moves quickly between minor releases; pin to avoid
+# breakage for judges running from a fresh venv.
+google-adk==2.3.0
+mcp==1.28.0
+google-genai==2.9.0
+streamlit==1.58.0
