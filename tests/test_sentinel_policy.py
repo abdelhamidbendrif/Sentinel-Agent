@@ -29,7 +29,9 @@ from sentinel_policy import (
     rule_email_allowlist,
     rule_out_of_scope,
     rule_rate_limit,
+    rule_requires_human_approval,
     HIGH_RISK_TOOLS,
+    HITL_TOOLS,
     EMAIL_ALLOWLIST_DOMAINS,
     MAX_CALLS_PER_TOOL_PER_SESSION,
 )
@@ -203,10 +205,139 @@ class TestAuditLog:
             log.record(f"tool_{i}", {}, v)
         assert len(log.entries) == 5
 
+# ---------------------------------------------------------------------------
+# rule_requires_human_approval (HITL)
+# ---------------------------------------------------------------------------
+
+class TestHITL:
+    def test_non_hitl_tool_passes_through(self):
+        """Tools not in HITL_TOOLS are never escalated for approval."""
+        v = rule_requires_human_approval("search_web", {}, {})
+        assert v.allow is True
+
+    def test_hitl_tool_returns_auth_verdict(self):
+        """transfer_funds must trigger AUTH state."""
+        v = rule_requires_human_approval(
+            "transfer_funds",
+            {"destination_account": "VENDOR-123", "amount_usd": 2500.0},
+            {},
+        )
+        assert v.allow is False
+        assert v.auth_required is True
+        assert v.rule == "human_approval_required"
+        assert "transfer" in v.reason.lower() or "hitl" in v.reason.lower()
+
+    def test_pre_approved_tool_passes_through(self):
+        """If the tool is in pre_approved_tools, HITL is skipped."""
+        state = {"pre_approved_tools": {"transfer_funds"}}
+        v = rule_requires_human_approval(
+            "transfer_funds",
+            {"destination_account": "VENDOR-123", "amount_usd": 2500.0},
+            state,
+        )
+        assert v.allow is True
+        assert v.rule == "human_approved"
+
+    def test_execute_shell_requires_approval(self):
+        """execute_shell is in HITL_TOOLS and must require approval."""
+        v = rule_requires_human_approval(
+            "execute_shell", {"command": "ls -la"}, {}
+        )
+        assert v.allow is False
+        assert v.auth_required is True
+
+    def test_taint_blocks_before_hitl(self):
+        """Taint propagation fires BEFORE HITL in the RULES pipeline.
+        An active injection attack must be auto-BLOCKED, not escalated."""
+        policy = SentinelPolicy(
+            expected_tools={"search_web", "transfer_funds"},
+            pre_approved_tools=set(),  # no pre-approval
+        )
+
+        class MockTool:
+            def __init__(self, name): self.name = name
+        class MockToolContext:
+            def __init__(self, state=None): self.state = state or {}
+
+        ctx = MockToolContext()
+        # Simulate taint from a previous tool call
+        ctx.state["tainted"]      = True
+        ctx.state["taint_source"] = "search_web"
+
+        result = policy.before_tool_callback(
+            MockTool("transfer_funds"),
+            {"destination_account": "ATTACKER-9999", "amount_usd": 9500.0},
+            ctx,
+        )
+        # Must be BLOCKED (not AUTH) -- taint fires first
+        assert result is not None
+        assert result["status"] == "blocked_by_sentinel"
+        assert result["rule"] == "taint_propagation"
+        # Specifically NOT pending_human_approval
+        assert result["status"] != "pending_human_approval"
+
+    def test_clean_payment_escalated_to_hitl(self):
+        """A clean (un-poisoned) transfer_funds call must reach HITL."""
+        policy = SentinelPolicy(
+            expected_tools={"transfer_funds"},
+            pre_approved_tools=set(),
+        )
+
+        class MockTool:
+            def __init__(self, name): self.name = name
+        class MockToolContext:
+            def __init__(self, state=None): self.state = state or {}
+
+        ctx = MockToolContext()
+        result = policy.before_tool_callback(
+            MockTool("transfer_funds"),
+            {"destination_account": "VENDOR-123", "amount_usd": 2500.0},
+            ctx,
+        )
+        # Must be AUTH (not BLOCK)
+        assert result is not None
+        assert result["status"] == "pending_human_approval"
+
+    def test_approved_payment_allowed(self):
+        """After human approval, the same transfer_funds call must be ALLOWED."""
+        policy = SentinelPolicy(
+            expected_tools={"transfer_funds"},
+            pre_approved_tools={"transfer_funds"},  # human approved
+        )
+
+        class MockTool:
+            def __init__(self, name): self.name = name
+        class MockToolContext:
+            def __init__(self, state=None): self.state = state or {}
+
+        ctx = MockToolContext()
+        result = policy.before_tool_callback(
+            MockTool("transfer_funds"),
+            {"destination_account": "VENDOR-123", "amount_usd": 2500.0},
+            ctx,
+        )
+        # Must be ALLOWED after human approval
+        assert result is None
+        assert policy.audit.entries[-1]["allowed"] is True
+
 
 # ---------------------------------------------------------------------------
-# SentinelPolicy (integration — no ADK/network needed)
+# Verdict dataclass
 # ---------------------------------------------------------------------------
+
+class TestVerdict:
+    def test_verdict_type_allow(self):
+        v = Verdict(True)
+        assert v.verdict_type == "allow"
+
+    def test_verdict_type_block(self):
+        v = Verdict(False, auth_required=False)
+        assert v.verdict_type == "block"
+
+    def test_verdict_type_auth(self):
+        v = Verdict(False, auth_required=True)
+        assert v.verdict_type == "auth"
+
 
 class TestSentinelPolicy:
     """Tests the full pipeline using a mock tool_context."""

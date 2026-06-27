@@ -24,17 +24,26 @@ session, not just the current call:
    (e.g. transfer_funds during a "summarize my notes" task) is flagged
    even if it doesn't contain an obvious injection string.
 
-Each rule returns a Verdict. If any rule returns BLOCK, the tool call is
-stopped (the callback returns a dict instead of None, which ADK uses as
-the synthetic tool result, skipping real execution) and the decision is
-logged for the write-up's audit trail.
+Verdict states
+--------------
+Sentinel supports three outcomes for every tool call:
+  ALLOW         -- call proceeds immediately, logged
+  AUTH          -- call is paused pending explicit human approval;
+                   a rich UI (dashboard) or CLI prompt presents the
+                   details and waits for a yes/no decision
+  BLOCK         -- call is cancelled and replaced with a synthetic
+                   error result; ADK never invokes the real tool
+
+The AUTH state is the key differentiator for enterprise deployments:
+high-stakes, irreversible actions (wiring money, running shell commands)
+are never silently allowed OR silently blocked -- they surface to a human
+decision-maker with full context.
 
 Thread-safety / concurrency note
 ---------------------------------
 SentinelPolicy is an *instance* -- one per agent session -- so concurrent
-Streamlit users never share audit state. Do NOT use the module-level
-RULES list or create a bare module-level AuditLog; always go through
-SentinelPolicy.
+Streamlit users never share audit state. Do NOT use module-level globals
+for per-session state.
 """
 
 from __future__ import annotations
@@ -49,6 +58,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 # Tools considered high-risk: irreversible or able to move data/money out.
 HIGH_RISK_TOOLS = {"send_email", "transfer_funds", "execute_shell"}
+
+# Tools that ALWAYS require explicit human approval, regardless of other
+# rules, unless they have been pre-approved for this session.
+# This is the HITL (human-in-the-loop) enforcement list.
+HITL_TOOLS = {"transfer_funds", "execute_shell"}
 
 # Recipient domains the agent is allowed to email without extra scrutiny.
 EMAIL_ALLOWLIST_DOMAINS = {"company.com"}
@@ -74,9 +88,24 @@ MAX_CALLS_PER_TOOL_PER_SESSION = 2
 
 @dataclass
 class Verdict:
+    """The outcome of a single rule evaluation.
+
+    allow=True, auth_required=False  → ALLOW  (proceed immediately)
+    allow=False, auth_required=True  → AUTH   (pause for human approval)
+    allow=False, auth_required=False → BLOCK  (cancel, return synthetic error)
+    """
     allow: bool
     reason: str = ""
     rule: str = ""
+    auth_required: bool = False  # True → AUTH state (human-in-the-loop)
+
+    @property
+    def verdict_type(self) -> str:
+        if self.allow:
+            return "allow"
+        if self.auth_required:
+            return "auth"
+        return "block"
 
 
 @dataclass
@@ -91,18 +120,25 @@ class AuditLog:
 
     def record(self, tool_name: str, args: dict, verdict: Verdict) -> None:
         self.entries.append({
-            "ts":      round(time.time(), 3),
-            "tool":    tool_name,
-            "args":    args,
-            "allowed": verdict.allow,
-            "rule":    verdict.rule,
-            "reason":  verdict.reason,
+            "ts":           round(time.time(), 3),
+            "tool":         tool_name,
+            "args":         args,
+            "allowed":      verdict.allow,
+            "auth_required": verdict.auth_required,
+            "type":         verdict.verdict_type,
+            "rule":         verdict.rule,
+            "reason":       verdict.reason,
         })
 
     def print_summary(self) -> None:
         print("\n--- Sentinel Audit Log ---")
         for e in self.entries:
-            status = "ALLOW" if e["allowed"] else "BLOCK"
+            if e["type"] == "allow":
+                status = "ALLOW"
+            elif e["type"] == "auth":
+                status = "AUTH (awaiting human)"
+            else:
+                status = "BLOCK"
             print(f"[{status}] tool={e['tool']} args={e['args']} "
                   f"rule={e['rule']!r} reason={e['reason']!r}")
         print("---------------------------\n")
@@ -111,18 +147,23 @@ class AuditLog:
 # ---------------------------------------------------------------------------
 # Individual rules.
 # Each takes (tool_name, args, session_state) and returns a Verdict.
-# They run in order; the first BLOCK wins.
+# They run in order; the first non-ALLOW verdict wins.
 # ---------------------------------------------------------------------------
 
 def rule_taint_propagation(tool_name: str, args: dict, state: dict) -> Verdict:
     """If the session is currently 'tainted' (we recently saw an injection
     pattern in a tool result) and the agent is about to call a high-risk
     tool, block it. This is the core defense against indirect prompt
-    injection chains: search_web -> poisoned result -> send_email."""
+    injection chains: search_web -> poisoned result -> transfer_funds.
+
+    Note: taint_propagation fires *before* human_approval_required, so a
+    tainted session is auto-BLOCKED without even asking the human. This is
+    intentional: an active injection attempt should not be escalated for
+    approval -- it should be terminated immediately."""
     if state.get("tainted") and tool_name in HIGH_RISK_TOOLS:
         return Verdict(False, rule="taint_propagation",
                         reason=f"Session tainted by '{state.get('taint_source')}'; "
-                                f"refusing high-risk tool '{tool_name}'.")
+                                f"auto-blocking '{tool_name}' without human escalation.")
     return Verdict(True)
 
 
@@ -165,13 +206,47 @@ def rule_rate_limit(tool_name: str, args: dict, state: dict) -> Verdict:
     return Verdict(True)
 
 
-# ---------------------------------------------------------------------------
-# LLM-as-judge rule (semantic injection detector).
-# This rule uses Gemini to semantically evaluate whether a tool result
-# contains adversarial content that bypasses the regex patterns above.
-# It is deliberately last in the pipeline (regex rules are faster and
-# cheaper for obvious patterns) and is skipped if no API key is available.
-# ---------------------------------------------------------------------------
+def rule_requires_human_approval(tool_name: str, args: dict, state: dict) -> Verdict:
+    """Human-in-the-loop (HITL) gate for high-stakes, irreversible actions.
+
+    Tools in HITL_TOOLS (transfer_funds, execute_shell) are never silently
+    allowed OR silently blocked for legitimate requests -- they are escalated
+    to a human decision-maker with full context (tool name, args, reason).
+
+    This rule fires AFTER taint_propagation, so an active injection attack
+    is auto-BLOCKED before ever reaching a human. HITL only surfaces for
+    calls that passed all automated checks -- i.e., calls that look like
+    they might be legitimate but are still too sensitive to execute silently.
+
+    A tool can be pre-approved for this session by adding its name to
+    state['pre_approved_tools'], which the dashboard does when the user
+    clicks the Approve button."""
+    if tool_name not in HITL_TOOLS:
+        return Verdict(True)
+
+    pre_approved = state.get("pre_approved_tools", set())
+    if tool_name in pre_approved:
+        return Verdict(True, rule="human_approved",
+                       reason=f"Human explicitly approved this '{tool_name}' call.")
+
+    # Format a human-readable summary of what the agent wants to do.
+    if tool_name == "transfer_funds":
+        dest = args.get("destination_account", "unknown")
+        amount = args.get("amount_usd", 0)
+        action_summary = f"Wire ${amount:,.2f} to account '{dest}'"
+    elif tool_name == "execute_shell":
+        cmd = args.get("command", "")
+        action_summary = f"Run shell command: `{cmd}`"
+    else:
+        action_summary = f"Execute {tool_name} with args {args}"
+
+    return Verdict(
+        False,
+        rule="human_approval_required",
+        reason=f"HITL gate: {action_summary}. Awaiting explicit human approval.",
+        auth_required=True,
+    )
+
 
 def rule_llm_judge(tool_name: str, args: dict, state: dict) -> Verdict:
     """Calls Gemini to semantically check whether the most recent tool
@@ -222,56 +297,67 @@ def rule_llm_judge(tool_name: str, args: dict, state: dict) -> Verdict:
     return Verdict(True)
 
 
-# The ordered rule pipeline. Earlier rules are cheaper and catch obvious
-# patterns; llm_judge is the semantic backstop for sophisticated payloads.
+# The ordered rule pipeline.
+# ORDER MATTERS:
+#   1. taint_propagation  -- auto-block active attacks immediately
+#   2. out_of_scope       -- block tools the task never declared
+#   3. email_allowlist    -- block external email recipients
+#   4. rate_limit         -- block abusive loops
+#   5. human_approval     -- HITL gate for sensitive-but-legitimate actions
+#   6. llm_judge          -- semantic backstop (opt-in, costs API quota)
 RULES: List[Callable[[str, dict, dict], Verdict]] = [
     rule_taint_propagation,
     rule_out_of_scope,
     rule_email_allowlist,
     rule_rate_limit,
+    rule_requires_human_approval,
     rule_llm_judge,
 ]
 
 
 # ---------------------------------------------------------------------------
 # SentinelPolicy: encapsulates one session's guardrail state.
-#
-# Usage:
-#     policy = SentinelPolicy(expected_tools={"search_web"})
-#     agent = LlmAgent(
-#         ...
-#         before_tool_callback=policy.before_tool_callback,
-#         after_tool_callback=policy.after_tool_callback,
-#     )
-#     # After the run:
-#     policy.audit.print_summary()
 # ---------------------------------------------------------------------------
 
 class SentinelPolicy:
     """One instance per agent session. Holds a private AuditLog so that
-    concurrent sessions (e.g. multiple Streamlit users) never share state."""
+    concurrent sessions (e.g. multiple Streamlit users) never share state.
+
+    Args:
+        expected_tools:    tools the task is explicitly allowed to use.
+        llm_judge_enabled: enable Gemini semantic injection classifier.
+        pre_approved_tools: tools the human has already approved for this
+                            session (populated by dashboard Approve button).
+    """
 
     def __init__(
         self,
         expected_tools: set[str] | None = None,
         llm_judge_enabled: bool = False,
+        pre_approved_tools: set[str] | None = None,
     ):
         self.audit = AuditLog()
-        self._expected_tools = expected_tools or set()
+        self._expected_tools    = expected_tools    or set()
         self._llm_judge_enabled = llm_judge_enabled
+        self._pre_approved_tools = pre_approved_tools or set()
 
     def _seed_state(self, state: dict) -> None:
         """Seeds ADK session state with the policy's initial config on the
-        first callback invocation. This is called lazily so we don't need
-        to reach into ADK internals at construction time."""
+        first callback invocation."""
         if "_sentinel_seeded" not in state:
-            state["expected_tools"] = self._expected_tools
-            state["llm_judge_enabled"] = self._llm_judge_enabled
-            state["_sentinel_seeded"] = True
+            state["expected_tools"]     = self._expected_tools
+            state["llm_judge_enabled"]  = self._llm_judge_enabled
+            state["pre_approved_tools"] = self._pre_approved_tools
+            state["_sentinel_seeded"]   = True
 
     def before_tool_callback(self, tool, args: Dict[str, Any], tool_context) -> Optional[Dict]:
-        """Runs before every tool call. Returns a dict (synthetic blocked
-        result) to stop execution, or None to allow the real call through."""
+        """Runs before every tool call.
+
+        Returns:
+          None               → ALLOW (let the real tool call proceed)
+          dict with status='blocked_by_sentinel'  → BLOCK
+          dict with status='pending_human_approval' → AUTH (paused)
+        """
         state = tool_context.state
         self._seed_state(state)
         tool_name = tool.name
@@ -280,11 +366,23 @@ class SentinelPolicy:
             verdict = rule(tool_name, args, state)
             if not verdict.allow:
                 self.audit.record(tool_name, args, verdict)
-                return {
-                    "status": "blocked_by_sentinel",
-                    "rule":   verdict.rule,
-                    "reason": verdict.reason,
-                }
+
+                if verdict.auth_required:
+                    # AUTH state: return a rich synthetic result so the
+                    # agent reports it needs human approval and stops.
+                    return {
+                        "status":  "pending_human_approval",
+                        "tool":    tool_name,
+                        "args":    str(args),
+                        "message": verdict.reason,
+                    }
+                else:
+                    # BLOCK state: return a synthetic error result.
+                    return {
+                        "status": "blocked_by_sentinel",
+                        "rule":   verdict.rule,
+                        "reason": verdict.reason,
+                    }
 
         self.audit.record(tool_name, args, Verdict(True, rule="-", reason="no rule triggered"))
         return None  # None == allow the real tool call to proceed
@@ -295,12 +393,12 @@ class SentinelPolicy:
         and taints the session if found, so the NEXT tool call is scrutinised
         even though this one looked harmless on its own."""
         state = tool_context.state
-        text = str(tool_response)
-        state["last_tool_output"] = text  # made available to rule_llm_judge
+        text  = str(tool_response)
+        state["last_tool_output"] = text
 
         if _INJECTION_RE.search(text):
-            state["tainted"] = True
+            state["tainted"]      = True
             state["taint_source"] = tool.name
             print(f"[Sentinel] Injection pattern detected in output of '{tool.name}'. "
                   f"Session marked TAINTED.")
-        return None  # don't modify the response, just observe it
+        return None
