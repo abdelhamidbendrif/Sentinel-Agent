@@ -53,6 +53,24 @@ async def wait_for_text(page, *texts, timeout=60000):
         return False
 
 
+async def smooth_scroll_down(page, total_px=900, steps=18, delay_ms=80):
+    """Smoothly scroll down to reveal verdict cards."""
+    step_px = total_px // steps
+    for _ in range(steps):
+        await page.evaluate(f"window.scrollBy({{top: {step_px}, behavior: 'smooth'}})")
+        await page.wait_for_timeout(delay_ms)
+    await page.wait_for_timeout(600)
+
+
+async def smooth_scroll_top(page, steps=10, delay_ms=60):
+    """Smoothly scroll back to the top."""
+    for _ in range(steps):
+        await page.evaluate("window.scrollBy({top: -200, behavior: 'smooth'})")
+        await page.wait_for_timeout(delay_ms)
+    await page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
+    await page.wait_for_timeout(500)
+
+
 async def click_button(page, text, timeout=10000):
     try:
         btn = page.locator(f"button:has-text('{text}')").first
@@ -204,7 +222,10 @@ async def record_live_demo(api_key: str):
         print("    Waiting for LLM + Sentinel verdict (up to 60s)...")
         found = await wait_for_text(page, "BLOCK", "ALLOW", "TAINTED", "blocked_by_sentinel",
                                     "503", "429", timeout=90000)
-        await page.wait_for_timeout(6000)          # hold on BLOCK verdict
+        await page.wait_for_timeout(2000)          # brief pause before scroll
+        await smooth_scroll_down(page, total_px=800)  # scroll to show all verdict cards
+        await page.wait_for_timeout(4000)          # hold on BLOCK verdict
+        await smooth_scroll_top(page)              # back to top for next scenario
 
         # ── SCENE 5: Payment Approval — HITL (second most important) ─────────
         print("[Scene 5] Payment Approval HITL scenario (live LLM)...")
@@ -216,7 +237,9 @@ async def record_live_demo(api_key: str):
         print("    Waiting for HITL AUTH verdict (up to 60s)...")
         found = await wait_for_text(page, "AUTH", "AWAITING", "Approve", "BLOCK", "ALLOW",
                                     timeout=90000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(1500)
+        await smooth_scroll_down(page, total_px=600)  # scroll to show AUTH card
+        await page.wait_for_timeout(2000)          # hold on AUTH verdict
 
         # Try clicking Approve if the panel appeared
         approved = await click_button(page, "Approve")
@@ -224,7 +247,9 @@ async def record_live_demo(api_key: str):
             await page.wait_for_timeout(500)
             print("    Waiting for approved result...")
             await wait_for_text(page, "ALLOW", "approved", "executed", timeout=60000)
-            await page.wait_for_timeout(5000)      # hold on approved result
+            await smooth_scroll_down(page, total_px=400)  # scroll to show approved result
+            await page.wait_for_timeout(4000)      # hold on approved result
+        await smooth_scroll_top(page)
 
         # ── SCENE 6: Prompt Injection ──────────────────────────────────────────
         print("[Scene 6] Prompt Injection scenario (live LLM)...")
@@ -235,7 +260,10 @@ async def record_live_demo(api_key: str):
         await page.wait_for_timeout(500)
         print("    Waiting for TAINTED + BLOCK verdict (up to 60s)...")
         await wait_for_text(page, "TAINTED", "BLOCK", "ALLOW", timeout=90000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(1500)
+        await smooth_scroll_down(page, total_px=900)  # scroll to show taint alert + block
+        await page.wait_for_timeout(4000)          # hold so viewer can read
+        await smooth_scroll_top(page)
 
         # ── SCENE 7: Data Exfiltration ─────────────────────────────────────────
         print("[Scene 7] Data Exfiltration scenario (live LLM)...")
@@ -246,7 +274,9 @@ async def record_live_demo(api_key: str):
         await page.wait_for_timeout(500)
         print("    Waiting for BLOCK verdict (up to 60s)...")
         await wait_for_text(page, "BLOCK", "ALLOW", timeout=90000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(1500)
+        await smooth_scroll_down(page, total_px=800)  # scroll to show block verdict
+        await page.wait_for_timeout(4000)          # hold on final verdict
 
         # ── Close ──────────────────────────────────────────────────────────────
         print("\nClosing and saving video...")
