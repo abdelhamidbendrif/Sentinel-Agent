@@ -53,22 +53,60 @@ async def wait_for_text(page, *texts, timeout=60000):
         return False
 
 
-async def smooth_scroll_down(page, total_px=900, steps=18, delay_ms=80):
-    """Smoothly scroll down to reveal verdict cards."""
+SCROLL_JS = """
+(function(px) {{
+    // Streamlit renders inside its own overflow container — target it directly
+    const selectors = [
+        '[data-testid="stAppViewContainer"]',
+        '[data-testid="stMain"]',
+        '.main',
+        'section.main',
+        'div.block-container',
+    ];
+    let el = null;
+    for (const s of selectors) {{
+        const found = document.querySelector(s);
+        if (found && found.scrollHeight > found.clientHeight) {{
+            el = found;
+            break;
+        }}
+    }}
+    if (el) {{
+        el.scrollBy({{top: px, behavior: 'smooth'}});
+    }} else {{
+        window.scrollBy({{top: px, behavior: 'smooth'}});
+    }}
+}})({px});
+"""
+
+async def smooth_scroll_down(page, total_px=900, steps=20, delay_ms=70):
+    """Smoothly scroll down inside Streamlit's scrollable container."""
     step_px = total_px // steps
     for _ in range(steps):
-        await page.evaluate(f"window.scrollBy({{top: {step_px}, behavior: 'smooth'}})")
+        await page.evaluate(SCROLL_JS.format(px=step_px))
         await page.wait_for_timeout(delay_ms)
-    await page.wait_for_timeout(600)
+    await page.wait_for_timeout(700)
 
 
-async def smooth_scroll_top(page, steps=10, delay_ms=60):
-    """Smoothly scroll back to the top."""
+async def smooth_scroll_top(page, steps=12, delay_ms=55):
+    """Smoothly scroll back to the top of Streamlit's container."""
     for _ in range(steps):
-        await page.evaluate("window.scrollBy({top: -200, behavior: 'smooth'})")
+        await page.evaluate(SCROLL_JS.format(px=-200))
         await page.wait_for_timeout(delay_ms)
-    await page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
-    await page.wait_for_timeout(500)
+    # Force back to very top
+    await page.evaluate("""
+        const selectors = [
+            '[data-testid="stAppViewContainer"]',
+            '[data-testid="stMain"]',
+            '.main', 'section.main', 'div.block-container'
+        ];
+        for (const s of selectors) {
+            const el = document.querySelector(s);
+            if (el) { el.scrollTo({top: 0, behavior: 'smooth'}); break; }
+        }
+        window.scrollTo({top: 0, behavior: 'smooth'});
+    """)
+    await page.wait_for_timeout(600)
 
 
 async def click_button(page, text, timeout=10000):
